@@ -15,8 +15,10 @@ python3 app.py --db organ_allocation.db
 ## 主要接口
 
 - `POST /api/donors`、`POST /api/candidates`：登记器官与候选患者。
-- `GET /api/donors/{id}/ranking`：查看兼容候选排序。
-- `POST /api/allocations`：提出唯一分配。
+- `POST /api/donor-batches`：多器官登记批次，捐献者血型、来源医院、地域、可用时间只填一遍，`organs` 中每件器官各自填写 `expires_at` 保存时限；漏填、批次内器官重复或时限非法时整批不保存。
+- `GET /api/donor-batches`、`GET /api/donor-batches/{id}`：协调台按批次查看已分配 / 待分配 / 已过期器官（协调员、分配员、审计员）；旧的单器官记录列在 `single_organs` 中。
+- `GET /api/donors/{id}/ranking`：查看兼容候选排序（仍按具体器官办理）。
+- `POST /api/allocations`：提出唯一分配。同一批次（同一捐献者）的器官不能分给同一患者（以患者姓名加所在医院判定）；撤回或过期只影响该件器官，其余器官照常流转。
 - `POST /api/allocations/{id}/accept`、`withdraw`：医院确认或撤回。
 - `POST /api/allocations/{id}/transit`、`delay`：冷链转运和延误上报。
 - `POST /api/allocations/{id}/handoff`、`handoff-accept`：来源医院发起、接收医院确认。
