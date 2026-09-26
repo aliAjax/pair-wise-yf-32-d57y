@@ -1,3 +1,18 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>器官分配协调台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;background:#f5f7fb;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001}pre{background:#0f172a;color:#86efac;padding:16px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#be123c;color:white;border:0;border-radius:6px}</style>
-<h1>器官分配协调台</h1><p>查看当前可用器官、候选患者和分配进度。写操作通过 JSON API 完成，医院接口需携带 X-Hospital。</p><section><input id="u" value="allocator"><input id="r" value="allocation_officer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let r=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;background:#f5f7fb;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001;margin-bottom:16px}pre{background:#0f172a;color:#86efac;padding:16px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#be123c;color:white;border:0;border-radius:6px}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #e2e8f0;padding:6px 8px;text-align:left;font-size:14px}.a{color:#15803d}.p{color:#b45309}.e{color:#b91c1c}</style>
+<h1>器官分配协调台</h1><p>按捐献批次查看已分配和待分配器官。写操作通过 JSON API 完成，医院接口需携带 X-Hospital。</p>
+<section><input id="u" value="allocator"><input id="r" value="allocation_officer"><button onclick="load()">刷新</button>
+<h3>捐献批次</h3><div id="b"></div></section>
+<section><h3>原始状态</h3><pre id="o"></pre></section>
+<script>
+const stageText={allocated:['已分配','a'],pending:['待分配','p'],expired:['已过期','e']};
+function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+async function load(){
+  let res=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}}),s=await res.json();
+  o.textContent=JSON.stringify(s,null,2);
+  if(!s.batches){b.innerHTML='<em>当前角色看不到批次视图（需协调员/分配员/审计员）。</em>';return}
+  let rows=s.batches.flatMap(x=>x.organs.map(g=>`<tr><td>${x.legacy_donor_id?'单器官#'+x.legacy_donor_id:'批次#'+x.id}</td><td>${esc(g.organ)}</td><td>${esc(g.blood_type)}</td><td class="${stageText[g.stage][1]}">${stageText[g.stage][0]}</td><td>${esc(g.patient_name||'—')}</td><td>${esc(g.expires_at)}</td></tr>`)).join('');
+  b.innerHTML='<table><tr><th>来源</th><th>器官</th><th>血型</th><th>阶段</th><th>受者</th><th>保存时限</th></tr>'+rows+'</table>'+
+    `<p>批次汇总：${s.batches.map(x=>`${x.legacy_donor_id?'单器官#'+x.legacy_donor_id:'批次#'+x.id} 已分配 ${x.allocated_count}/待分配 ${x.pending_count}/过期 ${x.expired_count}`).join('；')}</p>`;
+}
+load()</script>

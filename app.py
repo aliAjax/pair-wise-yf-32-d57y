@@ -19,8 +19,8 @@ STATUSES = {"proposed", "accepted", "in_transit", "handed_off", "implanted", "wi
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        super().__init__(message); self.status, self.code, self.message = status, code, message
+    def __init__(self, status: int, code: str, message: str, details: dict[str, Any] | None = None):
+        super().__init__(message); self.status, self.code, self.message, self.details = status, code, message, details
 
 
 def utcnow() -> datetime: return datetime.now(timezone.utc)
@@ -46,10 +46,16 @@ class Repository:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON"); self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript("""
+        CREATE TABLE IF NOT EXISTS donor_batches(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            blood_type TEXT NOT NULL, hospital TEXT NOT NULL, region TEXT NOT NULL, available_at TEXT NOT NULL,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS donors(
             id INTEGER PRIMARY KEY AUTOINCREMENT, blood_type TEXT NOT NULL, organ TEXT NOT NULL, hospital TEXT NOT NULL,
             region TEXT NOT NULL, available_at TEXT NOT NULL, expires_at TEXT NOT NULL, clinical_match INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'available', revision INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL, created_at TEXT NOT NULL
+            status TEXT NOT NULL DEFAULT 'available', revision INTEGER NOT NULL DEFAULT 1,
+            batch_id INTEGER REFERENCES donor_batches(id), created_by TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS candidates(
             id INTEGER PRIMARY KEY AUTOINCREMENT, patient_name TEXT NOT NULL, blood_type TEXT NOT NULL, organ TEXT NOT NULL,
@@ -74,6 +80,9 @@ class Repository:
             action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         """)
+        # 兼容在批次功能上线前创建的数据库：补齐 donors.batch_id 列
+        if "batch_id" not in {row["name"] for row in self.conn.execute("PRAGMA table_info(donors)")}:
+            self.conn.execute("ALTER TABLE donors ADD COLUMN batch_id INTEGER REFERENCES donor_batches(id)")
 
     @contextmanager
     def tx(self):
@@ -116,6 +125,63 @@ class OrganAllocationService:
                                (blood, organ, body["hospital"], body["region"], iso(available), iso(expires), int(body.get("clinical_match", 0)), actor, iso()))
             donor_id = cur.lastrowid; Repository.audit(conn, None, donor_id, actor, role, "donor_registered", {"organ": organ, "expires_at": iso(expires)})
             return dict(conn.execute("SELECT * FROM donors WHERE id=?", (donor_id,)).fetchone())
+
+    def register_donor_batch(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        """一次登记同一捐献者的多件器官：捐献者信息只填一遍，每件器官各写保存时限。
+
+        任一字段漏填、器官重复或时间窗口非法时整批不保存（单事务原子提交）。
+        """
+        if role not in {"coordinator", "allocation_officer"}: raise ApiError(403, "donor_forbidden", "当前角色不能登记器官")
+        errors: dict[str, Any] = {}
+        shared = ("blood_type", "hospital", "region", "available_at")
+        missing = [k for k in shared if not body.get(k)]
+        if missing: errors["missing_fields"] = missing
+        blood = str(body.get("blood_type", "")).upper()
+        if body.get("blood_type") and blood not in {"O", "A", "B", "AB"}: errors["invalid_blood_type"] = blood
+        available = None
+        if body.get("available_at"):
+            try: available = parse_time(body["available_at"])
+            except ApiError as exc: errors["invalid_available_at"] = exc.message
+        organs = body.get("organs")
+        items: list[tuple[str, datetime, int]] = []
+        seen: set[str] = set()
+        if not isinstance(organs, list) or not organs:
+            errors["organs_required"] = "organs 必须是非空数组，每件器官含 organ 和 expires_at"
+        else:
+            organ_errors: dict[int, Any] = {}
+            for index, entry in enumerate(organs):
+                item_errors: dict[str, str] = {}
+                if not isinstance(entry, dict): organ_errors[index] = "器官条目必须是对象"; continue
+                organ = str(entry.get("organ", "")).lower()
+                if not organ: item_errors["organ"] = "organ 必填"
+                elif organ in seen: item_errors["organ"] = "批次内器官重复"
+                else: seen.add(organ)
+                expires = None
+                if not entry.get("expires_at"): item_errors["expires_at"] = "expires_at 必填"
+                else:
+                    try:
+                        expires = parse_time(entry["expires_at"])
+                        if available is not None and expires <= available: item_errors["expires_at"] = "保存时限必须晚于可用开始时间"
+                    except ApiError as exc: item_errors["expires_at"] = exc.message
+                if item_errors: organ_errors[index] = item_errors
+                else: items.append((organ, expires, int(entry.get("clinical_match", 0))))
+            if organ_errors: errors["organs"] = organ_errors
+        if errors: raise ApiError(400, "invalid_batch", "批次校验失败，整批未保存", errors)
+        with self.repo.tx() as conn:
+            cur = conn.execute("""INSERT INTO donor_batches(blood_type,hospital,region,available_at,created_by,created_at)
+                                  VALUES(?,?,?,?,?,?)""",
+                               (blood, body["hospital"], body["region"], iso(available), actor, iso()))
+            batch_id = cur.lastrowid; created_at = iso()
+            donor_ids: list[int] = []
+            for organ, expires, clinical in items:
+                row = conn.execute("""INSERT INTO donors(blood_type,organ,hospital,region,available_at,expires_at,clinical_match,batch_id,created_by,created_at)
+                                      VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                                   (blood, organ, body["hospital"], body["region"], iso(available), iso(expires), clinical, batch_id, actor, created_at))
+                donor_ids.append(row.lastrowid)
+            Repository.audit(conn, None, None, actor, role, "donor_batch_registered",
+                             {"batch_id": batch_id, "organs": [{"organ": o, "donor_id": i, "expires_at": iso(e)} for (o, e, _), i in zip(items, donor_ids)]})
+            return {"batch": dict(conn.execute("SELECT * FROM donor_batches WHERE id=?", (batch_id,)).fetchone()),
+                    "donors": [dict(r) for r in conn.execute("SELECT * FROM donors WHERE batch_id=? ORDER BY id", (batch_id,))]}
 
     def register_candidate(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"coordinator", "allocation_officer"}: raise ApiError(403, "candidate_forbidden", "当前角色不能登记候选患者")
@@ -166,6 +232,13 @@ class OrganAllocationService:
             if candidate["status"] != "active" or not candidate["willing"]: raise ApiError(409, "candidate_unavailable", "候选患者当前不可接受分配")
             if donor["organ"] != candidate["organ"] or not blood_compatible(donor["blood_type"], candidate["blood_type"]):
                 raise ApiError(409, "medical_mismatch", "器官类型或血型不匹配")
+            if donor["batch_id"] is not None:
+                twin = conn.execute("""SELECT d.id FROM allocations a
+                                       JOIN donors d ON d.id=a.donor_id JOIN candidates c ON c.id=a.candidate_id
+                                       WHERE d.batch_id=? AND d.id<>? AND a.status NOT IN ('withdrawn','expired')
+                                         AND c.patient_name=? LIMIT 1""",
+                                    (donor["batch_id"], donor_id, candidate["patient_name"])).fetchone()
+                if twin: raise ApiError(409, "same_recipient", "同一捐献者的不同器官不能分给同一患者")
             if conn.execute("SELECT 1 FROM allocations WHERE donor_id=? AND status NOT IN ('withdrawn','expired')", (donor_id,)).fetchone():
                 raise ApiError(409, "already_allocated", "该器官已有有效分配")
             score = self._score(donor, candidate)
@@ -319,7 +392,57 @@ class OrganAllocationService:
             donors = [dict(r) for r in conn.execute("SELECT * FROM donors ORDER BY id DESC")]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates ORDER BY id DESC")]
             allocated = [dict(r) for r in conn.execute("SELECT * FROM allocations ORDER BY id DESC")]
-        return {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
+        payload = {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
+        if role in {"coordinator", "allocation_officer", "auditor"}: payload["batches"] = self.batches(role)
+        return payload
+
+    BATCH_ITEM_SQL = """SELECT d.id donor_id,d.organ,d.blood_type,d.expires_at,d.status donor_status,d.revision,
+                               a.id allocation_id,a.status allocation_status,c.patient_name,c.hospital candidate_hospital
+                        FROM donors d LEFT JOIN allocations a ON a.donor_id=d.id AND a.status NOT IN ('withdrawn','expired')
+                        LEFT JOIN candidates c ON c.id=a.candidate_id {where}"""
+
+    @staticmethod
+    def _compose_batch(batch: sqlite3.Row | None, items: list[dict[str, Any]]) -> dict[str, Any]:
+        allocated = sum(1 for item in items if item["stage"] == "allocated")
+        pending = sum(1 for item in items if item["stage"] == "pending")
+        expired = sum(1 for item in items if item["stage"] == "expired")
+        result = dict(batch) if batch else {}
+        result.update({"organ_count": len(items), "allocated_count": allocated, "pending_count": pending, "expired_count": expired, "organs": items})
+        return result
+
+    @staticmethod
+    def _batch_item(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        if item["allocation_id"] is not None:
+            item["stage"] = "allocated"
+        elif item["donor_status"] == "expired" or parse_time(item["expires_at"]) <= utcnow():
+            item["stage"] = "expired"  # 过期判定是惰性的，读取批次时按保存时限即时推导
+        else:
+            item["stage"] = "pending"
+        return item
+
+    def batches(self, role: str) -> list[dict[str, Any]]:
+        if role not in {"coordinator", "allocation_officer", "auditor"}:
+            raise ApiError(403, "batch_forbidden", "只有协调员、分配员或审计员可以查看捐献批次")
+        conn = self.repo.conn
+        result = []
+        for batch in conn.execute("SELECT * FROM donor_batches ORDER BY id DESC"):
+            items = [self._batch_item(r) for r in conn.execute(self.BATCH_ITEM_SQL.format(where="WHERE d.batch_id=? ORDER BY d.id"), (batch["id"],))]
+            result.append(self._compose_batch(batch, items))
+        # 批次功能上线前的单器官记录：各自作为单器官批次照常展示
+        for row in conn.execute(self.BATCH_ITEM_SQL.format(where="WHERE d.batch_id IS NULL ORDER BY d.id DESC")):
+            item = self._batch_item(row)
+            result.append(self._compose_batch(None, [item]) | {"id": None, "legacy_donor_id": item["donor_id"]})
+        return result
+
+    def get_batch(self, batch_id: int, role: str) -> dict[str, Any]:
+        if role not in {"coordinator", "allocation_officer", "auditor"}:
+            raise ApiError(403, "batch_forbidden", "只有协调员、分配员或审计员可以查看捐献批次")
+        conn = self.repo.conn
+        batch = conn.execute("SELECT * FROM donor_batches WHERE id=?", (batch_id,)).fetchone()
+        if not batch: raise ApiError(404, "batch_not_found", "批次不存在")
+        items = [self._batch_item(r) for r in conn.execute(self.BATCH_ITEM_SQL.format(where="WHERE d.batch_id=?"), (batch_id,))]
+        return self._compose_batch(batch, items)
 
 
 def json_reply(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -344,11 +467,14 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "ranking": return 200, self.service.ranking(int(parts[2]), role, hospital)
         if len(parts) == 3 and parts[:2] == ["api", "allocations"] and parts[2].isdigit(): return 200, self.service.get_allocation(int(parts[2]), role, hospital)
         if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "audit": return 200, {"audit": self.service.audit(int(parts[2]), role)}
+        if path == "/api/donor-batches": return 200, {"batches": self.service.batches(role)}
+        if len(parts) == 3 and parts[:2] == ["api", "donor-batches"] and parts[2].isdigit(): return 200, self.service.get_batch(int(parts[2]), role)
         raise ApiError(404, "not_found", "接口不存在")
     def dispatch_post(self, path: str) -> tuple[int, Any]:
         actor, role, hospital = self.service.identity(self.headers); body = self.read_body(); parts = [p for p in path.split("/") if p]
         actions = {
             "/api/donors": lambda: (201, self.service.register_donor(actor, role, body)),
+            "/api/donor-batches": lambda: (201, self.service.register_donor_batch(actor, role, body)),
             "/api/candidates": lambda: (201, self.service.register_candidate(actor, role, body)),
             "/api/allocations": lambda: (201, self.service.propose(actor, role, body)),
         }
@@ -373,7 +499,10 @@ class Handler(BaseHTTPRequestHandler):
                 raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
             status, payload = self.dispatch_get(parsed.path) if method == "GET" else self.dispatch_post(parsed.path)
             json_reply(self, status, payload)
-        except ApiError as exc: json_reply(self, exc.status, {"error": exc.code, "message": exc.message})
+        except ApiError as exc:
+            payload = {"error": exc.code, "message": exc.message}
+            if exc.details is not None: payload["details"] = exc.details
+            json_reply(self, exc.status, payload)
         except Exception as exc: print(f"unhandled error: {exc!r}"); json_reply(self, 500, {"error": "internal_error", "message": str(exc)})
     def do_GET(self) -> None: self.handle_any("GET")
     def do_POST(self) -> None: self.handle_any("POST")
